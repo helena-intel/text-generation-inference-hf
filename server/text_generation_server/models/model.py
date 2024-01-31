@@ -25,7 +25,10 @@ class Model(ABC):
         sliding_window: Optional[int] = None,
         speculate: Optional[int] = None,
     ):
-        self.model = model.eval()
+        if isinstance(model, torch.nn.Module):
+            self.model = model.eval()
+        else:
+            self.model = model
         self.tokenizer = tokenizer
         self.all_special_ids = set(tokenizer.all_special_ids)
         self.requires_padding = requires_padding
@@ -43,8 +46,9 @@ class Model(ABC):
             inspect.signature(model.forward).parameters.get("position_ids", None)
             is not None
         )
-
-        self.check_initialized()
+        
+        if isinstance(self.model, torch.nn.Module):
+            self.check_initialized()
 
     @property
     def info(self) -> InfoResponse:

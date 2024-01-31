@@ -39,6 +39,7 @@ def serve(
     logger_level: str = "INFO",
     json_output: bool = False,
     otlp_endpoint: Optional[str] = None,
+    deployment_framework: Optional[str] = None
 ):
     if sharded:
         assert (
@@ -135,6 +136,7 @@ def download_weights(
     is_local_model = (Path(model_id).exists() and Path(model_id).is_dir()) or os.getenv(
         "WEIGHTS_CACHE_OVERRIDE", None
     ) is not None
+    logger.info(f"======= is_local_model {is_local_model}")
 
     if not is_local_model:
         try:
@@ -286,10 +288,11 @@ def download_weights(
             # Name for this varible depends on transformers version.
             discard_names = getattr(class_, "_tied_weights_keys", [])
 
-        except Exception as e:
+        except Exception:
             discard_names = []
         # Convert pytorch weights to safetensors
-        utils.convert_files(local_pt_files, local_st_files, discard_names)
+        if not (Path(model_id) / "openvino_model.xml").exists():
+            utils.convert_files(local_pt_files, local_st_files, discard_names)
 
 
 @app.command()

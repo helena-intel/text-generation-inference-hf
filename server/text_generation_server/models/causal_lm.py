@@ -1,9 +1,11 @@
 import torch
 import time
+from pathlib import Path
 
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
+from optimum.intel import OVModelForCausalLM
 from typing import Optional, Tuple, List, Type, Dict
 
 from text_generation_server.models import Model
@@ -18,7 +20,6 @@ from text_generation_server.pb import generate_pb2
 from text_generation_server.utils import NextTokenChooser, StoppingCriteria, Sampling
 
 tracer = trace.get_tracer(__name__)
-
 
 @dataclass
 class CausalLMBatch(Batch):
@@ -377,77 +378,79 @@ class CausalLMBatch(Batch):
 
             start_index = end_index
 
-        first_past_kvs = batches[0].past_key_values
-        _, num_heads, padded_sequence_length, head_dim = first_past_kvs[0][1].shape
+        # TODO
+        if False:
+            first_past_kvs = batches[0].past_key_values
+            _, num_heads, padded_sequence_length, head_dim = first_past_kvs[0][1].shape
 
-        padded_past_values_shape = (
-            total_batch_size,
-            num_heads,
-            max_input_length - 1,
-            head_dim,
-        )
-
-        if batches[0].keys_head_dim_last:
-            padded_past_keys_shape = padded_past_values_shape
-        else:
-            # seq_length is last for BLOOM
-            padded_past_keys_shape = (
+            padded_past_values_shape = (
                 total_batch_size,
                 num_heads,
-                head_dim,
                 max_input_length - 1,
+                head_dim,
             )
 
-        # Iterate over attention layers
-        # Concatenate past key values layer by layer to allow incremental garbage collection
-        for j in range(len(first_past_kvs)):
-            padded_past_keys = first_past_kvs[j][0].new_zeros(padded_past_keys_shape)
-            start_index = 0
-            for batch in batches:
-                past_keys = batch.past_key_values[j][0]
-                # Clear reference to the original tensor
-                batch.past_key_values[j][0] = None
+            if batches[0].keys_head_dim_last:
+                padded_past_keys_shape = padded_past_values_shape
+            else:
+                # seq_length is last for BLOOM
+                padded_past_keys_shape = (
+                    total_batch_size,
+                    num_heads,
+                    head_dim,
+                    max_input_length - 1,
+                )
 
-                # Slicing end index for this batch
-                end_index = start_index + len(batch)
-                # We slice the keys to remove the padding from previous batches
-                past_seq_len = batch.max_input_length - 1
-                if batch.keys_head_dim_last:
-                    padded_past_keys[
+            # Iterate over attention layers
+            # Concatenate past key values layer by layer to allow incremental garbage collection
+            for j in range(len(first_past_kvs)):
+                padded_past_keys = first_past_kvs[j][0].new_zeros(padded_past_keys_shape)
+                start_index = 0
+                for batch in batches:
+                    past_keys = batch.past_key_values[j][0]
+                    # Clear reference to the original tensor
+                    batch.past_key_values[j][0] = None
+
+                    # Slicing end index for this batch
+                    end_index = start_index + len(batch)
+                    # We slice the keys to remove the padding from previous batches
+                    past_seq_len = batch.max_input_length - 1
+                    if batch.keys_head_dim_last:
+                        padded_past_keys[
+                            start_index:end_index, :, -past_seq_len:, :
+                        ] = past_keys[:, :, -past_seq_len:, :]
+                    else:
+                        # BLOOM case
+                        padded_past_keys[
+                            start_index:end_index, :, :, -past_seq_len:
+                        ] = past_keys[:, :, :, -past_seq_len:]
+                    del past_keys
+
+                    start_index = end_index
+
+                padded_past_values = first_past_kvs[j][1].new_zeros(
+                    padded_past_values_shape
+                )
+                start_index = 0
+                for batch in batches:
+                    past_values = batch.past_key_values[j][1]
+                    # Clear reference to the original tensor
+                    batch.past_key_values[j][1] = None
+
+                    # Slicing end index for this batch
+                    end_index = start_index + len(batch)
+                    # We slice the past values to remove the padding from previous batches
+                    past_seq_len = batch.max_input_length - 1
+                    padded_past_values[
                         start_index:end_index, :, -past_seq_len:, :
-                    ] = past_keys[:, :, -past_seq_len:, :]
-                else:
-                    # BLOOM case
-                    padded_past_keys[
-                        start_index:end_index, :, :, -past_seq_len:
-                    ] = past_keys[:, :, :, -past_seq_len:]
-                del past_keys
+                    ] = past_values[:, :, -past_seq_len:, :]
+                    del past_values
 
-                start_index = end_index
+                    # Update values
+                    start_index = end_index
 
-            padded_past_values = first_past_kvs[j][1].new_zeros(
-                padded_past_values_shape
-            )
-            start_index = 0
-            for batch in batches:
-                past_values = batch.past_key_values[j][1]
-                # Clear reference to the original tensor
-                batch.past_key_values[j][1] = None
-
-                # Slicing end index for this batch
-                end_index = start_index + len(batch)
-                # We slice the past values to remove the padding from previous batches
-                past_seq_len = batch.max_input_length - 1
-                padded_past_values[
-                    start_index:end_index, :, -past_seq_len:, :
-                ] = past_values[:, :, -past_seq_len:, :]
-                del past_values
-
-                # Update values
-                start_index = end_index
-
-            past_key_values.append([padded_past_keys, padded_past_values])
-
+                past_key_values.append([padded_past_keys, padded_past_values])
+            
         return cls(
             batch_id=batches[0].batch_id,
             requests=requests,
@@ -482,7 +485,11 @@ class CausalLM(Model):
         quantize: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
+        deployment_framework: Optional[str] = None,
     ):
+        #TODO, make configurable
+        deployment_framework = "openvino"
+        
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16 if dtype is None else dtype
@@ -500,16 +507,20 @@ class CausalLM(Model):
             truncation_side="left",
             trust_remote_code=trust_remote_code,
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            revision=revision,
-            torch_dtype=dtype,
-            device_map="auto"
-            if torch.cuda.is_available() and torch.cuda.device_count() > 1
-            else None,
-            load_in_8bit=quantize == "bitsandbytes",
-            trust_remote_code=trust_remote_code,
-        )
+        if deployment_framework == "openvino":
+            model = OVModelForCausalLM.from_pretrained(
+                model_id,
+                revision=revision,
+                device="CPU",
+                trust_remote_code=trust_remote_code,
+                export=not Path(model_id).is_dir()
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+            )
         if (
             torch.cuda.is_available()
             and torch.cuda.device_count() == 1
